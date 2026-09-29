@@ -34,26 +34,144 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("NOCTURNE DECK")]
 [assembly: AssemblyCompany("GM Edge Labs")]
 [assembly: AssemblyCopyright("GM Edge Labs 2026")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 namespace NocturneDeck
 {
     static class Program
     {
         public const int Port = 8977;
+        public const string Version = "1.0.1";
 
         [STAThread]
         static void Main()
         {
-            bool first;
-            using (var mutex = new Mutex(true, "NocturneDeckBridge_SingleInstance", out first))
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            var mutex = new Mutex(false, "NocturneDeckBridge_SingleInstance");
+            if (!Take(mutex, 0))
             {
-                if (!first) return; // already running
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new TrayApp());
+                // Another bridge is running. If it is this version or newer, leave it alone.
+                string other = PeerVersion();
+                if (other != null && Compare(other, Version) >= 0)
+                {
+                    MessageBox.Show("NOCTURNE DECK Bridge " + other + " is already running.\n\nYou find it in the tray next to the clock.",
+                        "NOCTURNE DECK Bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                // Older or broken bridge: close it and take over.
+                CloseOthers();
+                if (!Take(mutex, 5000))
+                {
+                    MessageBox.Show("An older NOCTURNE DECK Bridge is still running and could not be closed.\n\n" +
+                        "Right-click its tray icon and choose Exit (or restart the PC), then start this one again.",
+                        "NOCTURNE DECK Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
             }
+            try { Application.Run(new TrayApp()); }
+            finally { try { mutex.ReleaseMutex(); } catch { } }
+        }
+
+        static bool Take(Mutex m, int ms)
+        {
+            try { return m.WaitOne(ms); }
+            catch (AbandonedMutexException) { return true; } // previous owner was closed
+        }
+
+        // version of the bridge that answers on our port, or null if none / too old to say
+        static string PeerVersion()
+        {
+            try
+            {
+                var rq = (HttpWebRequest)WebRequest.Create("http://localhost:" + Port + "/version");
+                rq.Timeout = 1500; rq.Proxy = null;
+                using (var rs = (HttpWebResponse)rq.GetResponse())
+                using (var sr = new StreamReader(rs.GetResponseStream()))
+                {
+                    string body = sr.ReadToEnd();
+                    int i = body.IndexOf("\"version\"");
+                    if (i < 0) return null;
+                    int a = body.IndexOf('"', body.IndexOf(':', i) + 1), b = body.IndexOf('"', a + 1);
+                    return a > 0 && b > a ? body.Substring(a + 1, b - a - 1) : null;
+                }
+            }
+            catch { return null; }
+        }
+
+        public static int Compare(string a, string b)
+        {
+            System.Version x, y;
+            if (!System.Version.TryParse(a, out x)) return -1;
+            if (!System.Version.TryParse(b, out y)) return 1;
+            return x.CompareTo(y);
+        }
+
+        // Close every other copy of the bridge: same program name, same product, or whoever holds our port.
+        static void CloseOthers()
+        {
+            var me = System.Diagnostics.Process.GetCurrentProcess();
+            var portPids = PortOwners();
+            foreach (var p in System.Diagnostics.Process.GetProcesses())
+            {
+                try
+                {
+                    if (p.Id == me.Id) continue;
+                    bool hit = portPids.Contains(p.Id)
+                        || string.Equals(p.ProcessName, me.ProcessName, StringComparison.OrdinalIgnoreCase)
+                        || p.ProcessName.IndexOf("NocturneBridge", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!hit)
+                    {
+                        try
+                        {
+                            var fv = p.MainModule.FileVersionInfo;
+                            hit = (fv.ProductName ?? "").StartsWith("NOCTURNE DECK", StringComparison.OrdinalIgnoreCase)
+                               || (fv.FileDescription ?? "").StartsWith("NOCTURNE DECK", StringComparison.OrdinalIgnoreCase);
+                        }
+                        catch { }
+                    }
+                    if (hit) { p.Kill(); p.WaitForExit(3000); }
+                }
+                catch { }
+            }
+        }
+
+        // PIDs that registered http://localhost:<Port>/ with Windows (works in any Windows language)
+        static HashSet<int> PortOwners()
+        {
+            var found = new HashSet<int>();
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("netsh", "http show servicestate view=requestq")
+                { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+                string text;
+                using (var pr = System.Diagnostics.Process.Start(psi))
+                {
+                    text = pr.StandardOutput.ReadToEnd();
+                    pr.WaitForExit(4000);
+                }
+                var pids = new List<int>();
+                bool ours = false;
+                string mark = ":" + Port + "/";
+                foreach (var raw in (text + "\nEND").Split('\n'))
+                {
+                    string line = raw.TrimEnd(new[] { '\r' });
+                    if (line.Length > 0 && !char.IsWhiteSpace(line[0]))
+                    {
+                        if (ours) foreach (int id in pids) found.Add(id);
+                        pids.Clear(); ours = false;
+                        continue;
+                    }
+                    string t = line.Trim();
+                    int n;
+                    if (t.Length > 0 && t.All(char.IsDigit) && int.TryParse(t, out n)) pids.Add(n);
+                    if (t.IndexOf(mark, StringComparison.OrdinalIgnoreCase) >= 0) ours = true;
+                }
+            }
+            catch { }
+            found.Remove(0); found.Remove(4);
+            return found;
         }
     }
 
@@ -91,7 +209,12 @@ namespace NocturneDeck
             {
                 tray.ShowBalloonTip(8000, "NOCTURNE DECK Bridge", err, ToolTipIcon.Warning);
             }
-            else if (!AutostartOn() && FirstRun())
+            else if (AutostartOn())
+            {
+                // keep autostart pointing at this copy, so an older copy never starts again
+                SetAutostart(true);
+            }
+            else if (FirstRun())
             {
                 // first start: turn autostart on so it just keeps working (can be switched off in the menu)
                 SetAutostart(true);
@@ -103,7 +226,7 @@ namespace NocturneDeck
         string Status()
         {
             if (!server.Running) return "Not running (port " + Program.Port + " busy)";
-            return "Running on localhost:" + Program.Port + " - AIMP: " + Aimp.Api();
+            return "v" + Program.Version + " running on localhost:" + Program.Port + " - AIMP: " + Aimp.Api();
         }
 
         static bool FirstRun()
@@ -223,7 +346,11 @@ namespace NocturneDeck
             switch (path)
             {
                 case "":
-                    Send(ctx, 200, Json.Obj("ok", true, "name", "NOCTURNE DECK Bridge"));
+                    Send(ctx, 200, Json.Obj("ok", true, "name", "NOCTURNE DECK Bridge", "version", Program.Version));
+                    return;
+
+                case "/version":
+                    Send(ctx, 200, Json.Obj("ok", true, "version", Program.Version));
                     return;
 
                 case "/sessions":
@@ -237,7 +364,7 @@ namespace NocturneDeck
                         list.Add(s);
                     }
                     if (aimp != null) list.Add(aimp);
-                    Send(ctx, 200, Json.Obj("ok", true, "current", current, "sessions", list, "volume", Volume.Info("")));
+                    Send(ctx, 200, Json.Obj("ok", true, "version", Program.Version, "current", current, "sessions", list, "volume", Volume.Info("")));
                     return;
                 }
 
@@ -306,7 +433,7 @@ namespace NocturneDeck
                     string cur;
                     var d = new Dictionary<string, object>();
                     d["ok"] = true;
-                    d["bridge"] = "NOCTURNE DECK Bridge 1.0 (" + (Environment.Is64BitProcess ? "64" : "32") + "-bit)";
+                    d["bridge"] = "NOCTURNE DECK Bridge " + Program.Version + " (" + (Environment.Is64BitProcess ? "64" : "32") + "-bit)";
                     d["system"] = Environment.OSVersion.Version.ToString();
                     d["aimpRunning"] = Aimp.Running();
                     d["aimpApi"] = Aimp.Api();
