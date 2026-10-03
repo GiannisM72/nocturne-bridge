@@ -10,6 +10,8 @@
 // What it does NOT do: no internet access, no files written except one optional autostart
 // entry (HKCU ...\Run, only when you tick "Start automatically"), no admin rights.
 // It listens on http://localhost:8977 only, so nothing outside this PC can reach it.
+// The only connections it opens itself go to 127.0.0.1: VLC's web interface and foobar2000's
+// Beefweb component, and only when you have switched those on in the player.
 
 using System;
 using System.Collections;
@@ -34,15 +36,15 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("NOCTURNE DECK")]
 [assembly: AssemblyCompany("GM Edge Labs")]
 [assembly: AssemblyCopyright("GM Edge Labs 2026")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
 
 namespace NocturneDeck
 {
     static class Program
     {
         public const int Port = 8977;
-        public const string Version = "1.0.1";
+        public const string Version = "1.4.0";
 
         [STAThread]
         static void Main()
@@ -226,7 +228,7 @@ namespace NocturneDeck
         string Status()
         {
             if (!server.Running) return "Not running (port " + Program.Port + " busy)";
-            return "v" + Program.Version + " running on localhost:" + Program.Port + " - AIMP: " + Aimp.Api();
+            return "v" + Program.Version + " running on localhost:" + Program.Port + " - AIMP: " + Aimp.Api() + (Vlc.Live() ? " - VLC: connected" : "");
         }
 
         static bool FirstRun()
@@ -358,12 +360,17 @@ namespace NocturneDeck
                     var list = new List<object>();
                     string current = "";
                     Dictionary<string, object> aimp = Aimp.Info();
+                    Dictionary<string, object> vlc = null;
+                    try { Remote.Touch(); vlc = Vlc.Info(); } catch { vlc = null; }
                     foreach (var s in Media.Sessions(out current))
                     {
                         if (aimp != null && (string)s["app"] == "AIMP") { aimp["current"] = s["current"]; continue; }
+                        if (vlc != null && Vlc.Same((string)s["id"])) { vlc["current"] = s["current"]; continue; }
+                        if ((string)s["app"] == "foobar2000") { try { Foobar.Decorate(s); } catch { } }
                         list.Add(s);
                     }
                     if (aimp != null) list.Add(aimp);
+                    if (vlc != null) list.Add(vlc);
                     Send(ctx, 200, Json.Obj("ok", true, "version", Program.Version, "current", current, "sessions", list, "volume", Volume.Info("")));
                     return;
                 }
@@ -371,7 +378,7 @@ namespace NocturneDeck
                 case "/control":
                 {
                     string cmd = (q["cmd"] ?? "").ToLowerInvariant();
-                    bool ok = app == Aimp.Id ? Aimp.Command(cmd) : Media.Control(app, cmd);
+                    bool ok = app == Aimp.Id ? Aimp.Command(cmd) : app == Vlc.Id ? Vlc.Command(cmd) : Media.Control(app, cmd);
                     Send(ctx, 200, Json.Obj("ok", ok));
                     return;
                 }
@@ -418,15 +425,68 @@ namespace NocturneDeck
                     // /seek?app=<id>&pos=<seconds>
                     double sec;
                     bool ok = double.TryParse(q["pos"] ?? "", NumberStyles.Float, CultureInfo.InvariantCulture, out sec) && sec >= 0
-                              && (app == Aimp.Id ? Aimp.Seek(sec) : Media.Seek(app, sec));
+                              && (app == Aimp.Id ? Aimp.Seek(sec) : app == Vlc.Id ? Vlc.Seek(sec) : Media.Seek(app, sec));
                     Send(ctx, 200, Json.Obj("ok", ok));
                     return;
                 }
 
                 case "/toggle":
-                    // /toggle?app=aimp-remote&what=repeat|shuffle  (AIMP only)
-                    Send(ctx, 200, Json.Obj("ok", app == Aimp.Id && Aimp.Toggle((q["what"] ?? "").ToLowerInvariant())));
+                {
+                    // /toggle?app=<id>&what=repeat|shuffle[&set=on|off]  (AIMP, VLC, foobar2000 with Beefweb). Without set it flips the state.
+                    // The answer also carries the state after the change: "on".
+                    string what = (q["what"] ?? "").ToLowerInvariant(), set = (q["set"] ?? "").ToLowerInvariant();
+                    if (app == Vlc.Id) { Send(ctx, 200, Json.Write(Vlc.Flag(what, set))); return; }
+                    if (Foobar.Is(app)) { Send(ctx, 200, Json.Write(Foobar.Flag(what, set))); return; }
+                    bool done = app == Aimp.Id && (set == "on" ? Aimp.SetFlag(what, true) : set == "off" ? Aimp.SetFlag(what, false) : Aimp.Toggle(what));
+                    if (!done) { Send(ctx, 200, Json.Obj("ok", false)); return; }
+                    Thread.Sleep(60);
+                    Send(ctx, 200, Json.Obj("ok", true, "on", what == "repeat" ? Aimp.Repeat() : Aimp.Shuffle()));
                     return;
+                }
+
+                case "/playlist":
+                {
+                    // /playlist?app=<id>[&since=<stamp>]  -> the playlist that player plays from (read-only):
+                    // AIMP 4/5, VLC (web interface) and foobar2000 (Beefweb). Sources that can do it carry "playlist": true in /sessions.
+                    // Every other player answers ok=false. With since=<stamp of the last answer> the track list is left out while unchanged.
+                    if (app == Vlc.Id) { Send(ctx, 200, Json.Write(Vlc.Playlist(q["since"] ?? ""))); return; }
+                    if (Foobar.Is(app)) { Send(ctx, 200, Json.Write(Foobar.Playlist(q["since"] ?? ""))); return; }
+                    if (app != Aimp.Id || !Aimp.Running()) { Send(ctx, 200, Json.Obj("ok", false, "error", "no playlist for this player")); return; }
+                    Send(ctx, 200, Json.Write(AimpPlaylist.Read(Aimp.CurrentFile(), q["since"] ?? "")));
+                    return;
+                }
+
+                case "/mixer":
+                    // /mixer -> every program that plays sound on the default output (volume 0-100, muted, live peak 0..1),
+                    //           plus the output devices and which one is the default
+                    Send(ctx, 200, Json.Write(Mixer.List()));
+                    return;
+
+                case "/mixer/set":
+                {
+                    // /mixer/set?app=<name from /mixer>[&volume=0..100][&mute=on|off|toggle]
+                    int vol = -1, parsed;
+                    if (int.TryParse(q["volume"] ?? "", NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed)) vol = Math.Max(0, Math.Min(100, parsed));
+                    Send(ctx, 200, Json.Write(Mixer.Set(app, vol, (q["mute"] ?? "").ToLowerInvariant())));
+                    return;
+                }
+
+                case "/output":
+                    // /output?set=<id from /mixer outputs>  -> make that device the default output
+                    Send(ctx, 200, Json.Write(Mixer.SetOutput(q["set"] ?? "")));
+                    return;
+
+                case "/jump":
+                {
+                    // /jump?app=<id>&index=<n>  -> play track n (0-based) of the playlist that /playlist reports.
+                    int idx;
+                    if ((app == Vlc.Id || Foobar.Is(app)) && int.TryParse(q["index"] ?? "", NumberStyles.Integer, CultureInfo.InvariantCulture, out idx))
+                    { Send(ctx, 200, Json.Write(app == Vlc.Id ? Vlc.Jump(idx) : Foobar.Jump(idx))); return; }
+                    if (app != Aimp.Id || !Aimp.Running() || !int.TryParse(q["index"] ?? "", NumberStyles.Integer, CultureInfo.InvariantCulture, out idx))
+                    { Send(ctx, 200, Json.Obj("ok", false, "error", "not available")); return; }
+                    Send(ctx, 200, Json.Write(AimpPlaylist.Jump(idx)));
+                    return;
+                }
 
                 case "/debug":
                 {
@@ -438,10 +498,13 @@ namespace NocturneDeck
                     d["aimpRunning"] = Aimp.Running();
                     d["aimpApi"] = Aimp.Api();
                     d["aimp"] = Aimp.Info();
+                    if (Aimp.Running() && Aimp.Api() == "new")      // what AIMP answers for mute / repeat / shuffle, unprocessed
+                        d["aimpRaw"] = new Dictionary<string, object> { { "mute", Aimp.Raw(0x60) }, { "repeat", Aimp.Raw(0x70) }, { "shuffle", Aimp.Raw(0x80) } };
                     d["mediaError"] = Media.LastError;
                     d["mediaSessions"] = Media.Sessions(out cur);
                     d["volume"] = Volume.Info("");
                     d["spectrum"] = Spectrum.Status;
+                    try { d["vlc"] = Vlc.Status(); d["foobar2000"] = Foobar.Status(); } catch { }
                     Send(ctx, 200, Json.Write(d, true), "application/json");
                     return;
                 }
@@ -727,6 +790,20 @@ namespace NocturneDeck
             return (long)r;
         }
 
+        // Like Send, but tells "no answer" apart from the value: AIMP answers "on" for mute / repeat / shuffle with a
+        // non-zero value that is not always 1 (seen with AIMP 5.40), and -1 is also what Send returns on failure.
+        static bool TrySend(uint msg, long w, long l, out long value)
+        {
+            value = 0;
+            IntPtr h = Wnd(), r;
+            if (h == IntPtr.Zero) return false;
+            if (SendMessageTimeout(h, msg, (IntPtr)w, (IntPtr)l, 2 /* abort if hung */, 700, out r) == IntPtr.Zero) return false;
+            value = (long)r;
+            return true;
+        }
+        static bool On(int prop) { long v; return TrySend(WM_AIMP_PROPERTY, prop, 0, out v) && v != 0; }
+        public static long Raw(int prop) { long v; return TrySend(WM_AIMP_PROPERTY, prop, 0, out v) ? v : long.MinValue; }
+
         public static string Api()
         {
             if (!Running()) return "not running";
@@ -748,17 +825,26 @@ namespace NocturneDeck
         static long PositionMs() { return IsNew() ? Send(WM_AIMP_PROPERTY, 0x20, 0) : Status(31) * 1000; }
         static long DurationMs() { return IsNew() ? Send(WM_AIMP_PROPERTY, 0x30, 0) : Status(32) * 1000; }
         public static int Volume() { return (int)(IsNew() ? Send(WM_AIMP_PROPERTY, 0x50, 0) : Status(1)); }
-        public static bool Muted() { return (IsNew() ? Send(WM_AIMP_PROPERTY, 0x60, 0) : Status(5)) == 1; }
+        public static bool Muted() { return IsNew() ? On(0x60) : Status(5) == 1; }
 
         // repeat: new 0x70 / legacy 29, shuffle: new 0x80 / legacy 41
-        static bool Flag(int prop, int sts) { return (IsNew() ? Send(WM_AIMP_PROPERTY, prop, 0) : Status(sts)) == 1; }
+        static bool Flag(int prop, int sts) { return IsNew() ? On(prop) : Status(sts) == 1; }
+        public static bool Shuffle() { return Flag(0x80, 41); }
+        public static bool Repeat() { return Flag(0x70, 29); }
         public static bool Toggle(string what)
         {
             if (!Running()) return false;
             int prop = what == "repeat" ? 0x70 : what == "shuffle" ? 0x80 : 0, sts = what == "repeat" ? 29 : what == "shuffle" ? 41 : 0;
             if (prop == 0) return false;
-            bool now = Flag(prop, sts);
-            if (IsNew()) Send(WM_AIMP_PROPERTY, prop | 1, now ? 0 : 1); else SetStatus(sts, now ? 0 : 1);
+            return SetFlag(what, !Flag(prop, sts));
+        }
+        // Sets repeat / shuffle to a given state (no reading involved).
+        public static bool SetFlag(string what, bool on)
+        {
+            if (!Running()) return false;
+            int prop = what == "repeat" ? 0x70 : what == "shuffle" ? 0x80 : 0, sts = what == "repeat" ? 29 : what == "shuffle" ? 41 : 0;
+            if (prop == 0) return false;
+            if (IsNew()) Send(WM_AIMP_PROPERTY, prop | 1, on ? 1 : 0); else SetStatus(sts, on ? 1 : 0);
             return true;
         }
 
@@ -796,6 +882,37 @@ namespace NocturneDeck
             if (c == "pause" && st != 2) return true;      // legacy pause toggles: only send while playing
             int fn = c == "play" ? (st == 1 ? 16 : 15) : c == "pause" ? 16 : c == "stop" ? 17 : c == "next" ? 18 : c == "prev" ? 19 : 0;
             return fn != 0 && CallFn(fn);
+        }
+
+        // Full path (or URL) of the track AIMP has loaded, "" if none. Reads the same shared memory block as Info().
+        public static string CurrentFile()
+        {
+            try
+            {
+                using (var mmf = MemoryMappedFile.OpenExisting(NAME, MemoryMappedFileRights.Read))
+                using (var v = mmf.CreateViewAccessor(0, 2048, MemoryMappedFileAccess.Read))
+                {
+                    int header = v.ReadInt32(0);
+                    if (header < 88 || header > 512) header = 88;
+                    if (v.ReadInt32(4) == 0) return "";
+                    long pos = header;
+                    for (int i = 0; i < 6; i++)
+                    {
+                        int len = Math.Max(0, v.ReadInt32(40 + i * 4));
+                        if (i == 3)                                   // memory order: album, artist, date, fileName, genre, title
+                        {
+                            int n = len;
+                            if (pos + n * 2 > 2048) n = (int)Math.Max(0, (2048 - pos) / 2);
+                            var b = new byte[n * 2];
+                            v.ReadArray(pos, b, 0, b.Length);
+                            return Encoding.Unicode.GetString(b).TrimEnd('\0');
+                        }
+                        pos += len * 2;
+                    }
+                }
+            }
+            catch { }
+            return "";
         }
 
         public static Dictionary<string, object> Info()
@@ -1459,6 +1576,500 @@ namespace NocturneDeck
         }
     }
 
+    // ------------------------------------------------------------------ per-program volume and output switch (Core Audio sessions)
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int Item(uint index, out IMMDevice device);
+    }
+    // Same COM interface as IMMDeviceEnumerator above; this declaration returns the device list as an object.
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumeratorList
+    {
+        [PreserveSig] int EnumAudioEndpoints(int flow, int stateMask, out IMMDeviceCollection devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice ep);
+    }
+    [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionManager2
+    {
+        [PreserveSig] int GetAudioSessionControl(IntPtr sessionGuid, int flags, out IntPtr control);
+        [PreserveSig] int GetSimpleAudioVolume(IntPtr sessionGuid, int flags, out IntPtr volume);
+        [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator sessions);
+    }
+    [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionEnumerator
+    {
+        [PreserveSig] int GetCount(out int count);
+        [PreserveSig] int GetSession(int index, [MarshalAs(UnmanagedType.IUnknown)] out object session);
+    }
+    // IAudioSessionControl (first nine methods) followed by IAudioSessionControl2. Unused slots keep their place only.
+    [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionControl2
+    {
+        [PreserveSig] int GetState(out int state);                    // 0 inactive, 1 active, 2 expired
+        [PreserveSig] int Slot1();
+        [PreserveSig] int Slot2();
+        [PreserveSig] int Slot3();
+        [PreserveSig] int Slot4();
+        [PreserveSig] int Slot5();
+        [PreserveSig] int Slot6();
+        [PreserveSig] int Slot7();
+        [PreserveSig] int Slot8();
+        [PreserveSig] int Slot9();
+        [PreserveSig] int Slot10();
+        [PreserveSig] int GetProcessId(out uint pid);
+        [PreserveSig] int IsSystemSoundsSession();                    // 0 = yes, 1 = no
+    }
+    [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ISimpleAudioVolume
+    {
+        [PreserveSig] int SetMasterVolume(float level, ref Guid ctx);
+        [PreserveSig] int GetMasterVolume(out float level);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid ctx);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    }
+    // Not a documented Windows interface: it is what the Sound control panel itself uses to change the default device.
+    // Only SetDefaultEndpoint (11th method) is called; the ten before it keep their place only.
+    [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPolicyConfig
+    {
+        [PreserveSig] int Slot0();
+        [PreserveSig] int Slot1();
+        [PreserveSig] int Slot2();
+        [PreserveSig] int Slot3();
+        [PreserveSig] int Slot4();
+        [PreserveSig] int Slot5();
+        [PreserveSig] int Slot6();
+        [PreserveSig] int Slot7();
+        [PreserveSig] int Slot8();
+        [PreserveSig] int Slot9();
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int role);
+    }
+    [ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")] class PolicyConfigClient { }
+
+    static class Mixer
+    {
+        const int MaxApps = 8;
+
+        static void Free(object o) { try { if (o != null && Marshal.IsComObject(o)) Marshal.ReleaseComObject(o); } catch { } }
+
+        // Calls visit(processName, state, session) for every live session of the default output device.
+        static void Each(Action<string, int, object> visit)
+        {
+            var en = (IMMDeviceEnumeratorList)new MMDeviceEnumeratorCom();
+            IMMDevice dev = null; object mo = null; IAudioSessionEnumerator se = null;
+            try
+            {
+                Marshal.ThrowExceptionForHR(en.GetDefaultAudioEndpoint(0, 1, out dev));
+                Guid iid = typeof(IAudioSessionManager2).GUID;
+                Marshal.ThrowExceptionForHR(dev.Activate(ref iid, 23, IntPtr.Zero, out mo));
+                Marshal.ThrowExceptionForHR(((IAudioSessionManager2)mo).GetSessionEnumerator(out se));
+                int n;
+                Marshal.ThrowExceptionForHR(se.GetCount(out n));
+                uint self;
+                using (var me = System.Diagnostics.Process.GetCurrentProcess()) self = (uint)me.Id;
+                for (int i = 0; i < n; i++)
+                {
+                    object so = null;
+                    try
+                    {
+                        if (se.GetSession(i, out so) != 0 || so == null) continue;
+                        var c = (IAudioSessionControl2)so;
+                        int state; uint pid;
+                        if (c.GetState(out state) != 0 || state == 2) continue;          // expired
+                        if (c.IsSystemSoundsSession() == 0) continue;                    // Windows notification sounds
+                        if (c.GetProcessId(out pid) != 0 || pid == 0 || pid == self) continue;   // not the bridge's own listening stream
+                        string exe;
+                        try { using (var p = System.Diagnostics.Process.GetProcessById((int)pid)) exe = p.ProcessName; } catch { continue; }
+                        visit(exe, state, so);
+                    }
+                    catch { }
+                    finally { Free(so); }
+                }
+            }
+            finally { Free(se); Free(mo); Free(dev); Free(en); }
+        }
+
+        public static Dictionary<string, object> List()
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                var apps = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+                var order = new List<string>();
+                Each(delegate(string exe, int state, object so)
+                {
+                    var v = (ISimpleAudioVolume)so;
+                    float level; bool mute; float peak = 0;
+                    if (v.GetMasterVolume(out level) != 0) return;
+                    v.GetMute(out mute);
+                    try { ((IAudioMeterInformation)so).GetPeakValue(out peak); } catch { peak = 0; }
+                    Dictionary<string, object> a;
+                    if (!apps.TryGetValue(exe, out a))
+                    {
+                        a = new Dictionary<string, object>();
+                        a["app"] = exe; a["name"] = Names.Friendly(exe); a["volume"] = (int)Math.Round(level * 100);
+                        a["muted"] = mute; a["peak"] = Math.Round(peak, 3); a["active"] = state == 1;
+                        apps[exe] = a; order.Add(exe);
+                    }
+                    else                                                              // several streams of one program: one row
+                    {
+                        a["muted"] = (bool)a["muted"] && mute;
+                        a["peak"] = Math.Max((double)a["peak"], Math.Round(peak, 3));
+                        a["active"] = (bool)a["active"] || state == 1;
+                    }
+                });
+                var list = new List<object>();
+                foreach (var k in order) if ((bool)apps[k]["active"] && list.Count < MaxApps) list.Add(apps[k]);
+                foreach (var k in order) if (!(bool)apps[k]["active"] && list.Count < MaxApps) list.Add(apps[k]);
+                d["sessions"] = list;
+                d["outputs"] = Outputs();
+                d["ok"] = true;
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        public static Dictionary<string, object> Set(string app, int volume, string mute)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                int hits = 0;
+                Each(delegate(string exe, int state, object so)
+                {
+                    if (!string.Equals(exe, app, StringComparison.OrdinalIgnoreCase)) return;
+                    var v = (ISimpleAudioVolume)so;
+                    Guid ctx = Guid.Empty;
+                    if (volume >= 0) v.SetMasterVolume(volume / 100f, ref ctx);
+                    if (mute == "on" || mute == "off" || mute == "toggle")
+                    {
+                        bool cur; v.GetMute(out cur);
+                        v.SetMute(mute == "on" ? true : mute == "off" ? false : !cur, ref ctx);
+                    }
+                    hits++;
+                });
+                d["ok"] = hits > 0;
+                if (hits == 0) d["error"] = "program not found";
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        // Active output devices. The names come from the registry, where Windows keeps them as plain text.
+        static List<object> Outputs()
+        {
+            var list = new List<object>();
+            var en = (IMMDeviceEnumeratorList)new MMDeviceEnumeratorCom();
+            IMMDevice def = null; IMMDeviceCollection col = null;
+            try
+            {
+                string current = "";
+                if (en.GetDefaultAudioEndpoint(0, 1, out def) == 0 && def != null) def.GetId(out current);
+                if (en.EnumAudioEndpoints(0, 1, out col) != 0 || col == null) return list;
+                uint n;
+                col.GetCount(out n);
+                for (uint i = 0; i < n && i < 16; i++)
+                {
+                    IMMDevice dev = null;
+                    try
+                    {
+                        if (col.Item(i, out dev) != 0 || dev == null) continue;
+                        string id; dev.GetId(out id);
+                        var o = new Dictionary<string, object>();
+                        o["id"] = id; o["name"] = DeviceName(id, (int)i + 1); o["current"] = id == current;
+                        list.Add(o);
+                    }
+                    catch { }
+                    finally { Free(dev); }
+                }
+            }
+            finally { Free(col); Free(def); Free(en); }
+            return list;
+        }
+
+        static string DeviceName(string id, int number)
+        {
+            try
+            {
+                int at = id.LastIndexOf('{');
+                if (at >= 0)
+                    using (var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
+                    using (var k = hklm.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render\\" + id.Substring(at) + "\\Properties"))
+                    {
+                        if (k != null)
+                        {
+                            string desc = k.GetValue("{a45c254e-df1c-4efd-8020-67d146a850e0},2") as string;
+                            string card = k.GetValue("{b3f8fa53-0004-438e-9003-51a46e139bfc},6") as string;
+                            if (!string.IsNullOrEmpty(desc)) return string.IsNullOrEmpty(card) ? desc : desc + " (" + card + ")";
+                        }
+                    }
+            }
+            catch { }
+            return "Output " + number.ToString(CultureInfo.InvariantCulture);
+        }
+
+        public static Dictionary<string, object> SetOutput(string id)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                bool known = false;
+                foreach (Dictionary<string, object> o in Outputs()) if ((string)o["id"] == id) known = true;
+                if (!known) { d["error"] = "unknown output"; return d; }
+                var pc = (IPolicyConfig)new PolicyConfigClient();
+                try
+                {
+                    Marshal.ThrowExceptionForHR(pc.SetDefaultEndpoint(id, 0));     // console
+                    Marshal.ThrowExceptionForHR(pc.SetDefaultEndpoint(id, 1));     // multimedia
+                }
+                finally { Free(pc); }
+                d["ok"] = true; d["outputs"] = Outputs();
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+    }
+
+    // ------------------------------------------------------------------ AIMP playlist (read-only)
+    // AIMP 4/5 keep every playlist as <profile>\PLS\<name>.aimppl4: UTF-16 text, one track per line under
+    // "#-----CONTENT-----#", fields separated by '|' (0 path, 1 title, 2 artist, ... 14 length in ms); lines
+    // starting with '-' are group headers. AIMP.ini [Playlist.Manager] PlayingStorage names the playlist that
+    // is playing. The files are only read, never written. AIMP 2/3 use another format: they get ok=false.
+    static class AimpPlaylist
+    {
+        const int MaxTracks = 3000;
+        static readonly object gate = new object();
+        static string cachePath = "", cacheStamp = "", cacheName = "";
+        static List<string> cacheFiles = new List<string>();
+        static List<object> cacheTracks = new List<object>();
+        static int lastScan;
+        static bool scanned;
+
+        public static Dictionary<string, object> Read(string currentFile, string since)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                lock (gate)
+                {
+                    bool have = cachePath != "" && File.Exists(cachePath);
+                    bool fresh = have && Stamp(cachePath, cacheTracks.Count) == cacheStamp && (currentFile == "" || IndexOf(currentFile) >= 0);
+                    if (!fresh && (!scanned || unchecked(Environment.TickCount - lastScan) >= 4000))
+                    {
+                        scanned = true; lastScan = Environment.TickCount;
+                        string path = Pick(currentFile);
+                        if (path != null) Load(path); else if (!have) cachePath = "";
+                    }
+                    if (cachePath == "") { d["error"] = "no AIMP playlist found"; return d; }
+                    d["ok"] = true; d["app"] = Aimp.Id; d["name"] = cacheName; d["stamp"] = cacheStamp;
+                    d["count"] = cacheTracks.Count; d["index"] = currentFile == "" ? -1 : IndexOf(currentFile);
+                    if (since != "" && since == cacheStamp) d["unchanged"] = true; else d["tracks"] = cacheTracks;
+                }
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        // AIMP's remote interface has no "play track n". The bridge walks there with Next / Previous (muted when
+        // it is more than one step, shuffle off for the walk) and checks after every step that AIMP really is on
+        // the expected file. It stops at the first surprise and always restores mute and shuffle.
+        const int MaxSteps = 80;
+        public static Dictionary<string, object> Jump(int target)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                string now = Aimp.CurrentFile();
+                if (now == "")                                  // stopped: start playback so AIMP has a current track
+                {
+                    Aimp.Command("play");
+                    for (int w = 0; w < 100 && now == ""; w++) { Thread.Sleep(20); now = Aimp.CurrentFile(); }
+                }
+                string[] files;
+                lock (gate)
+                {
+                    Read(now, "");                              // makes sure the cached playlist is the one that is playing
+                    files = cacheFiles.ToArray();
+                }
+                if (target < 0 || target >= files.Length) { d["error"] = "no such track"; return d; }
+                int cur = Find(files, now);
+                if (cur < 0) { d["error"] = "playing track is not in the playlist"; return d; }
+                int steps = Math.Abs(target - cur);
+                if (steps > MaxSteps) { d["error"] = "too far"; return d; }
+                bool wasPlaying = Aimp.State() == 2;
+                bool failed = false;
+                if (steps > 0)
+                {
+                    bool wasMuted = Aimp.Muted(), wasShuffle = Aimp.Shuffle(), quiet = steps > 1 && !wasMuted;
+                    try
+                    {
+                        if (quiet) Aimp.SetMute(true);
+                        if (wasShuffle) { Aimp.SetFlag("shuffle", false); Thread.Sleep(60); }
+                        int dir = target > cur ? 1 : -1;
+                        string cmd = dir > 0 ? "next" : "prev";
+                        for (int i = cur; i != target && !failed; i += dir)
+                        {
+                            string want = files[i + dir];
+                            bool same = string.Equals(want, files[i], StringComparison.OrdinalIgnoreCase);
+                            Aimp.Command(cmd);
+                            if (same) { Thread.Sleep(250); continue; }       // the same file twice in a row: nothing to compare
+                            if (WaitFor(want, 2000)) continue;
+                            if (dir < 0 && string.Equals(Aimp.CurrentFile(), files[i], StringComparison.OrdinalIgnoreCase))
+                            {
+                                Aimp.Command(cmd);                           // first "previous" only restarted the track
+                                if (WaitFor(want, 2000)) continue;
+                            }
+                            failed = true;
+                        }
+                    }
+                    finally
+                    {
+                        if (wasShuffle) Aimp.SetFlag("shuffle", true);
+                        if (quiet) Aimp.SetMute(false);
+                    }
+                }
+                d["index"] = Find(files, Aimp.CurrentFile());
+                if (failed) { d["error"] = "could not reach the track"; return d; }
+                if (!wasPlaying || Aimp.State() != 2) Aimp.Command("play");
+                d["ok"] = true;
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        static int Find(string[] files, string file)
+        {
+            for (int i = 0; i < files.Length; i++)
+                if (string.Equals(files[i], file, StringComparison.OrdinalIgnoreCase)) return i;
+            return -1;
+        }
+
+        static bool WaitFor(string file, int ms)
+        {
+            int start = Environment.TickCount;
+            while (unchecked(Environment.TickCount - start) < ms)
+            {
+                if (string.Equals(Aimp.CurrentFile(), file, StringComparison.OrdinalIgnoreCase)) return true;
+                Thread.Sleep(15);
+            }
+            return false;
+        }
+
+        static string Stamp(string path, int count)
+        {
+            return File.GetLastWriteTimeUtc(path).Ticks.ToString(CultureInfo.InvariantCulture) + "-" + count.ToString(CultureInfo.InvariantCulture);
+        }
+
+        static int IndexOf(string file)
+        {
+            for (int i = 0; i < cacheFiles.Count; i++)
+                if (string.Equals(cacheFiles[i], file, StringComparison.OrdinalIgnoreCase)) return i;
+            return -1;
+        }
+
+        // Profile folders to look in: next to a running portable AIMP first, then the normal one in AppData.
+        static List<string> Profiles()
+        {
+            var list = new List<string>();
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName("AIMP"))
+                {
+                    try { list.Add(Path.Combine(Path.GetDirectoryName(p.MainModule.FileName), "Profile")); } catch { }
+                }
+            }
+            catch { }
+            list.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AIMP"));
+            return list;
+        }
+
+        // AIMP may be writing the file: open it shared and read it whole (BOM decides UTF-16 / UTF-8).
+        static string ReadText(string path)
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var sr = new StreamReader(fs, Encoding.Unicode, true))
+                return sr.ReadToEnd();
+        }
+
+        static string IniValue(string text, string section, string key)
+        {
+            bool inside = false;
+            foreach (var raw in text.Split(new[] { '\n' }))
+            {
+                string line = raw.Trim();
+                if (line.StartsWith("[", StringComparison.Ordinal)) { inside = string.Equals(line, "[" + section + "]", StringComparison.OrdinalIgnoreCase); continue; }
+                if (inside && line.StartsWith(key + "=", StringComparison.OrdinalIgnoreCase)) return line.Substring(key.Length + 1).Trim();
+            }
+            return "";
+        }
+
+        // The playlist that holds the playing file wins, then the one AIMP.ini calls "playing", then the newest.
+        static string Pick(string currentFile)
+        {
+            string best = null; int bestScore = -1; DateTime bestTime = DateTime.MinValue;
+            foreach (var profile in Profiles())
+            {
+                string pls = Path.Combine(profile, "PLS");
+                if (!Directory.Exists(pls)) continue;
+                string playing = "";
+                try { playing = IniValue(ReadText(Path.Combine(profile, "AIMP.ini")), "Playlist.Manager", "PlayingStorage"); } catch { }
+                foreach (var f in Directory.GetFiles(pls, "*.aimppl4"))
+                {
+                    try
+                    {
+                        string text = ReadText(f);
+                        int score = 0;
+                        if (currentFile != "" && text.IndexOf("\n" + currentFile + "|", StringComparison.OrdinalIgnoreCase) >= 0) score += 2;
+                        if (playing != "" && text.IndexOf("ID=" + playing, StringComparison.OrdinalIgnoreCase) >= 0) score += 1;
+                        DateTime t = File.GetLastWriteTimeUtc(f);
+                        if (score > bestScore || (score == bestScore && t > bestTime)) { best = f; bestScore = score; bestTime = t; }
+                    }
+                    catch { }
+                }
+                if (best != null) break;
+            }
+            return best;
+        }
+
+        static void Load(string path)
+        {
+            var files = new List<string>();
+            var tracks = new List<object>();
+            string name = "";
+            bool content = false;
+            foreach (var raw in ReadText(path).Split(new[] { '\n' }))
+            {
+                string line = raw.TrimEnd(new[] { '\r' });
+                if (line.Length == 0) continue;
+                if (line[0] == '#') { content = line.StartsWith("#-----CONTENT", StringComparison.Ordinal); continue; }
+                if (!content) { if (line.StartsWith("Name=", StringComparison.Ordinal)) name = line.Substring(5); continue; }
+                if (line[0] == '-') continue;                          // group header
+                if (tracks.Count >= MaxTracks) break;
+                string[] f = line.Split(new[] { '|' });
+                string file = f[0], title = f.Length > 1 ? f[1] : "", artist = f.Length > 2 ? f[2] : "";
+                double ms = 0;
+                if (f.Length > 14) double.TryParse(f[14], NumberStyles.Float, CultureInfo.InvariantCulture, out ms);
+                if (title == "")
+                {
+                    try { title = Path.GetFileNameWithoutExtension(file); } catch { title = ""; }
+                    if (string.IsNullOrEmpty(title)) title = file;
+                }
+                var t = new Dictionary<string, object>();
+                t["title"] = title; t["artist"] = artist; t["duration"] = Math.Round(Math.Max(0, ms) / 1000.0, 1);
+                files.Add(file); tracks.Add(t);
+            }
+            cachePath = path; cacheName = name; cacheFiles = files; cacheTracks = tracks;
+            cacheStamp = Stamp(path, tracks.Count);
+        }
+    }
+
     // Finds the main process of a player from its media id / name.
     static class Procs
     {
@@ -1597,7 +2208,943 @@ namespace NocturneDeck
         }
     }
 
-    // ------------------------------------------------------------------ tiny JSON writer
+    // ------------------------------------------------------------------ players with their own local web interface
+    // VLC (its built-in "Web" interface) and foobar2000 (the Beefweb component) are asked on 127.0.0.1 only.
+    // A background thread reads their state twice a second while a widget is polling /sessions, so the http
+    // thread never waits for a player. Commands go out directly with a short timeout.
+    // Nothing here runs unless the player was set up for it: VLC needs a web password, foobar2000 needs Beefweb.
+
+    static class Web
+    {
+        public class Reply
+        {
+            public int Code;                 // 0 = no answer
+            public byte[] Body;
+            public string Text { get { try { return Body == null ? "" : Encoding.UTF8.GetString(Body); } catch { return ""; } } }
+            public bool Ok { get { return Code >= 200 && Code < 300; } }
+        }
+
+        public static string Basic(string user, string password)
+        {
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes((user ?? "") + ":" + (password ?? "")));
+        }
+
+        // method GET or POST; auth = Basic value or ""; json = POST body or null. Never throws.
+        public static Reply Call(string method, string url, string auth, string json, int ms)
+        {
+            var r = new Reply();
+            try
+            {
+                var rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.Method = method; rq.Proxy = null; rq.Timeout = ms; rq.ReadWriteTimeout = ms;
+                rq.AllowAutoRedirect = false; rq.KeepAlive = true;
+                rq.UserAgent = "NocturneBridge/" + Program.Version;
+                try { rq.ServicePoint.Expect100Continue = false; } catch { }
+                if (!string.IsNullOrEmpty(auth)) rq.Headers["Authorization"] = "Basic " + auth;
+                if (method == "POST")
+                {
+                    byte[] body = Encoding.UTF8.GetBytes(json ?? "");
+                    rq.ContentLength = body.Length;
+                    if (body.Length > 0)
+                    {
+                        rq.ContentType = "application/json";
+                        using (var s = rq.GetRequestStream()) s.Write(body, 0, body.Length);
+                    }
+                }
+                using (var rs = (HttpWebResponse)rq.GetResponse()) Read(rs, r);
+            }
+            catch (WebException e)
+            {
+                var rs = e.Response as HttpWebResponse;
+                if (rs != null)
+                {
+                    try { Read(rs, r); } catch { }
+                    try { rs.Close(); } catch { }
+                }
+            }
+            catch { }
+            return r;
+        }
+
+        static void Read(HttpWebResponse rs, Reply r)
+        {
+            r.Code = (int)rs.StatusCode;
+            using (var s = rs.GetResponseStream())
+            using (var ms = new MemoryStream())
+            {
+                if (s != null)
+                {
+                    var buf = new byte[16384];
+                    int n;
+                    while ((n = s.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        ms.Write(buf, 0, n);
+                        if (ms.Length > 24 * 1024 * 1024) break;     // nothing a player sends is this large
+                    }
+                }
+                r.Body = ms.ToArray();
+            }
+        }
+    }
+
+    // Optional NocturneBridge.ini next to the exe. Only needed when a player does not use its defaults:
+    //   [vlc]          port=8080   password=...   enabled=off
+    //   [foobar2000]   port=8880   user=...       password=...   enabled=off
+    static class Ini
+    {
+        static readonly object gate = new object();
+        static Dictionary<string, string> values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        static DateTime stamp = DateTime.MinValue;
+        static int checkedAt;
+        static bool looked;
+
+        public static string Get(string section, string key)
+        {
+            lock (gate)
+            {
+                if (!looked || unchecked(Environment.TickCount - checkedAt) >= 3000)
+                {
+                    looked = true; checkedAt = Environment.TickCount;
+                    try { Load(); } catch { }
+                }
+                string v;
+                return values.TryGetValue(section + "." + key, out v) ? v : "";
+            }
+        }
+
+        public static bool Off(string section)
+        {
+            string v = Get(section, "enabled").ToLowerInvariant();
+            return v == "off" || v == "0" || v == "false" || v == "no";
+        }
+
+        static void Load()
+        {
+            string path = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath) ?? "", "NocturneBridge.ini");
+            if (!File.Exists(path))
+            {
+                if (values.Count > 0) values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                stamp = DateTime.MinValue;
+                return;
+            }
+            DateTime t = File.GetLastWriteTimeUtc(path);
+            if (t == stamp) return;
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string section = "";
+            foreach (var raw in File.ReadAllLines(path))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == ';' || line[0] == '#') continue;
+                if (line[0] == '[' && line[line.Length - 1] == ']') { section = line.Substring(1, line.Length - 2).Trim(); continue; }
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                d[section + "." + line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+            }
+            values = d; stamp = t;
+        }
+    }
+
+    static class Remote
+    {
+        static readonly object gate = new object();
+        static Thread thread;
+        static int touchedAt;
+        static bool touched;
+
+        // a widget asked for /sessions within the last 10 s
+        static bool Wanted { get { return touched && unchecked(Environment.TickCount - touchedAt) < 10000; } }
+
+        public static void Touch()
+        {
+            touchedAt = Environment.TickCount; touched = true;
+            if (thread != null) return;
+            lock (gate)
+            {
+                if (thread != null) return;
+                thread = new Thread(Loop) { IsBackground = true, Name = "players" };
+                thread.Start();
+            }
+        }
+
+        static void Loop()
+        {
+            while (true)
+            {
+                if (Wanted)
+                {
+                    try { Vlc.Tick(); } catch { }
+                    try { Foobar.Tick(); } catch { }
+                }
+                Thread.Sleep(500);
+            }
+        }
+
+        public static long Hash(long h, string s)
+        {
+            if (s == null) s = "";
+            unchecked
+            {
+                foreach (char c in s) h = (h ^ c) * 1099511628211L;
+                return (h ^ 0x1F) * 1099511628211L;
+            }
+        }
+        public const long HashSeed = 1469598103934665603L;
+    }
+
+    // ------------------------------------------------------------------ VLC (desktop) through its Web interface
+    // VLC 3 does not report to Windows, so without this it is not a source at all. Setup in VLC:
+    //   Tools > Preferences > Show settings: All > Interface > Main interfaces: tick "Web"
+    //   Interface > Main interfaces > Lua > Lua HTTP > Password: any password. Save, restart VLC.
+    // The bridge reads port and password from VLC's own settings file (%APPDATA%\vlc\vlcrc) or from NocturneBridge.ini.
+    static class Vlc
+    {
+        public const string Id = "vlc-http";
+        const int MaxTracks = 3000;
+        static readonly object gate = new object();
+
+        // connection
+        static string baseUrl = "", auth = "";
+        static bool cfgOk, cfgLooked;
+        static int cfgAt;
+        static string rcPath = "", rcPass = "", rcPort = "";
+        static DateTime rcStamp = DateTime.MinValue;
+
+        // state
+        static Dictionary<string, object> snap;        // the session as /sessions shows it
+        static int snapAt;
+        static double snapRate = 1;
+        static string curId = "";                      // playlist id of the playing item
+        static int failures, failedAt;
+        static string note = "not set up";
+
+        // art
+        static string artKey = "";
+        static int artSeq;
+
+        // playlist
+        static List<string> listIds = new List<string>();
+        static List<object> listTracks = new List<object>();
+        static string listStamp = "", listName = "";
+        static bool listHave;
+        static int listAt, listWantAt;
+        static bool listWant;
+
+        static bool Configure()
+        {
+            if (cfgLooked && unchecked(Environment.TickCount - cfgAt) < 3000) return cfgOk;
+            cfgLooked = true; cfgAt = Environment.TickCount;
+            cfgOk = false;
+            if (Ini.Off("vlc")) { note = "switched off in NocturneBridge.ini"; return false; }
+            string pass = Ini.Get("vlc", "password"), port = Ini.Get("vlc", "port");
+            if (pass == "" || port == "")
+            {
+                try { ReadRc(); } catch { }
+                if (pass == "") pass = rcPass;
+                if (port == "") port = rcPort;
+            }
+            if (pass == "") { note = "not set up (no web password in VLC)"; return false; }
+            int p;
+            if (!int.TryParse(port, NumberStyles.Integer, CultureInfo.InvariantCulture, out p) || p < 1 || p > 65535) p = 8080;
+            baseUrl = "http://127.0.0.1:" + p.ToString(CultureInfo.InvariantCulture);
+            auth = Web.Basic("", pass);
+            cfgOk = true;
+            return true;
+        }
+
+        // VLC writes "http-password=..." (and "http-port=...") without the leading # once they are set.
+        static void ReadRc()
+        {
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "vlc", "vlcrc");
+            if (!File.Exists(path)) { rcPath = ""; rcPass = ""; rcPort = ""; rcStamp = DateTime.MinValue; return; }
+            DateTime t = File.GetLastWriteTimeUtc(path);
+            if (path == rcPath && t == rcStamp) return;
+            string pass = "", port = "";
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var sr = new StreamReader(fs, Encoding.UTF8, true))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    if (line.StartsWith("http-password=", StringComparison.Ordinal)) pass = line.Substring(14).Trim();
+                    else if (line.StartsWith("http-port=", StringComparison.Ordinal)) port = line.Substring(10).Trim();
+                }
+            }
+            rcPath = path; rcStamp = t; rcPass = pass; rcPort = port;
+        }
+
+        static void Drop()
+        {
+            lock (gate) { snap = null; curId = ""; listHave = false; }
+        }
+
+        // the session for /sessions, or null when VLC is not reachable
+        public static Dictionary<string, object> Info()
+        {
+            lock (gate)
+            {
+                if (snap == null || unchecked(Environment.TickCount - snapAt) > 3000) return null;
+                var d = new Dictionary<string, object>(snap);
+                if ((string)d["status"] == "playing")
+                {
+                    double pos = (double)d["position"] + unchecked(Environment.TickCount - snapAt) / 1000.0 * snapRate;
+                    double dur = (double)d["duration"];
+                    if (dur > 0) pos = Math.Min(pos, dur);
+                    d["position"] = Math.Round(Math.Max(0, pos), 1);
+                }
+                return d;
+            }
+        }
+
+        public static bool Live() { lock (gate) return snap != null && unchecked(Environment.TickCount - snapAt) <= 3000; }
+
+        // A desktop VLC that also reports to Windows would show twice. The Store app is a different program and stays.
+        public static bool Same(string mediaId)
+        {
+            string low = (mediaId ?? "").ToLowerInvariant();
+            return low.Contains("vlc") && !low.StartsWith("videolan.vlc_", StringComparison.Ordinal);
+        }
+
+        public static Dictionary<string, object> Status()
+        {
+            var d = new Dictionary<string, object>();
+            bool ok = false;
+            try { ok = Configure(); } catch { }
+            d["setUp"] = ok;
+            d["address"] = ok ? baseUrl : "";
+            d["state"] = Live() ? "connected" : note;
+            return d;
+        }
+
+        public static void Tick()
+        {
+            if (!Configure()) { Drop(); return; }
+            int now = Environment.TickCount;
+            if (failures > 0 && unchecked(now - failedAt) < (failures > 3 ? 5000 : 1200)) return;
+            var j = Ask("");
+            if (j == null) return;
+            try { Art(j); } catch { }
+            bool want;
+            lock (gate) want = listWant && unchecked(Environment.TickCount - listWantAt) < 12000
+                               && (!listHave || unchecked(Environment.TickCount - listAt) >= 2000 || (curId != "" && !listIds.Contains(curId)));
+            if (want) { try { LoadList(); } catch { } }
+        }
+
+        // One call to status.json, with or without a command. Updates the session. null = no usable answer.
+        static Dictionary<string, object> Ask(string command)
+        {
+            var r = Web.Call("GET", baseUrl + "/requests/status.json" + (command == "" ? "" : "?command=" + command), auth, null, 1500);
+            var j = r.Code == 200 ? Json.Parse(r.Text) as Dictionary<string, object> : null;
+            if (j == null || !j.ContainsKey("state"))
+            {
+                failures++; failedAt = Environment.TickCount;
+                note = r.Code == 401 ? "wrong password (VLC answered 401)" : r.Code == 0 ? "no answer (VLC closed, or its Web interface is off)" : "unexpected answer (" + r.Code + ")";
+                if (failures >= 2) Drop();
+                return null;
+            }
+            failures = 0; note = "connected";
+            Build(j);
+            return j;
+        }
+
+        static void Build(Dictionary<string, object> j)
+        {
+            var meta = Json.At(j, "information", "category", "meta") as Dictionary<string, object>;
+            string title = Json.Text(meta, "title"), artist = Json.Text(meta, "artist"), album = Json.Text(meta, "album");
+            string file = Json.Text(meta, "filename"), radio = Json.Text(meta, "now_playing");
+            if (title == "") title = NoExt(file);
+            if (radio != "") { if (album == "") album = title; title = radio; }
+
+            string state = Json.Text(j, "state").ToLowerInvariant();
+            if (state != "playing" && state != "paused") state = "stopped";
+            double length = Math.Max(0, Json.Number(j, "length", 0)), frac = Json.Number(j, "position", -1), time = Math.Max(0, Json.Number(j, "time", 0));
+            double pos = length > 0 && frac >= 0 && frac <= 1 ? frac * length : time;
+            if (state == "stopped") { pos = 0; }
+            double rate = Json.Number(j, "rate", 1);
+            if (rate <= 0 || rate > 8) rate = 1;
+
+            // audio details: VLC translates the labels, so look at the values ("44100 Hz", "320 kb/s", "Stereo")
+            int hz = 0, kbps = 0, ch = 0;
+            var cats = Json.At(j, "information", "category") as Dictionary<string, object>;
+            if (cats != null)
+            {
+                foreach (var kv in cats)
+                {
+                    if (kv.Key == "meta") continue;
+                    var c = kv.Value as Dictionary<string, object>;
+                    if (c == null) continue;
+                    int h = 0, k = 0, n = 0;
+                    foreach (var f in c)
+                    {
+                        string v = f.Value as string;
+                        if (v == null) continue;
+                        int num = Lead(v);
+                        if (num > 0 && v.EndsWith(" Hz", StringComparison.OrdinalIgnoreCase)) h = num;
+                        else if (num > 0 && v.EndsWith(" kb/s", StringComparison.OrdinalIgnoreCase)) k = num;
+                        else if (string.Equals(v, "Stereo", StringComparison.OrdinalIgnoreCase)) n = 2;
+                        else if (string.Equals(v, "Mono", StringComparison.OrdinalIgnoreCase)) n = 1;
+                    }
+                    if (h > 0 || k > 0) { hz = h; kbps = k; ch = n; break; }      // the first stream with a sample rate or bit rate is the audio
+                }
+            }
+            string ext = "";
+            try { ext = Path.GetExtension(file).TrimStart(new[] { '.' }).ToUpperInvariant(); } catch { }
+            if (ext.Length == 0 || ext.Length > 5) ext = "";
+
+            var d = new Dictionary<string, object>();
+            d["id"] = Id; d["app"] = "VLC"; d["current"] = false;
+            d["title"] = title; d["artist"] = artist; d["album"] = album;
+            d["status"] = state;
+            d["position"] = Math.Round(pos, 1); d["duration"] = Math.Round(length, 1);
+            d["bitrate"] = kbps; d["sampleRate"] = hz; d["channels"] = ch;
+            d["format"] = ext;
+            d["repeat"] = Json.Flag(j, "loop") || Json.Flag(j, "repeat");
+            d["shuffle"] = Json.Flag(j, "random");
+            d["playlist"] = true;
+            string plid = Json.Text(j, "currentplid");
+            lock (gate)
+            {
+                object art;
+                d["art"] = snap != null && snap.TryGetValue("art", out art) ? art : "";
+                snap = d; snapAt = Environment.TickCount; snapRate = rate;
+                curId = plid == "-1" ? "" : plid;
+            }
+        }
+
+        static int Lead(string v)
+        {
+            int n = 0, i = 0;
+            while (i < v.Length && v[i] >= '0' && v[i] <= '9' && i < 9) { n = n * 10 + (v[i] - '0'); i++; }
+            return i == 0 ? 0 : n;
+        }
+
+        static readonly string[] MediaExt = { ".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".ape", ".wv", ".mpc",
+            ".aiff", ".aif", ".alac", ".dsf", ".dff", ".mka", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg", ".ts", ".flv" };
+        static string NoExt(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            foreach (var e in MediaExt)
+                if (name.Length > e.Length && name.EndsWith(e, StringComparison.OrdinalIgnoreCase)) return name.Substring(0, name.Length - e.Length);
+            return name;
+        }
+
+        // Cover of the playing item: VLC serves it on /art once "artwork_url" is known.
+        static void Art(Dictionary<string, object> j)
+        {
+            string url = Json.Text(Json.At(j, "information", "category", "meta"), "artwork_url");
+            string key = Json.Text(j, "currentplid") + "|" + url;
+            if (key == artKey) return;
+            byte[] img = null;
+            if (url != "")
+            {
+                var r = Web.Call("GET", baseUrl + "/art", auth, null, 2000);
+                if (r.Code == 200 && r.Body != null && r.Body.Length > 64 && Image(r.Body)) img = r.Body;
+                else if (r.Code == 0) return;                             // try again on the next tick
+            }
+            artKey = key;
+            if (img != null) { try { img = ArtTools.Trim(img); } catch { } }
+            var a = new Media.Art { Key = key, Id = Interlocked.Increment(ref artSeq) + 200000, Bytes = img, Type = img != null ? Media.Sniff(img) : null };
+            lock (Media.ArtCache) Media.ArtCache[Id] = a;
+            lock (gate) if (snap != null) snap["art"] = img != null ? a.Id.ToString() : "";
+        }
+
+        static bool Image(byte[] b)
+        {
+            return (b[0] == 0xFF && b[1] == 0xD8) || (b[0] == 0x89 && b[1] == 0x50) || (b[0] == 0x47 && b[1] == 0x49)
+                || (b[0] == 0x42 && b[1] == 0x4D) || (b.Length > 12 && b[8] == 0x57 && b[9] == 0x45);
+        }
+
+        public static bool Command(string c)
+        {
+            if (!Configure()) return false;
+            string status = "";
+            lock (gate) if (snap != null) status = (string)snap["status"];
+            string cmd = c == "toggle" ? "pl_pause"
+                       : c == "play" ? (status == "paused" ? "pl_forceresume" : status == "playing" ? "" : "pl_play")
+                       : c == "pause" ? "pl_forcepause" : c == "stop" ? "pl_stop" : c == "next" ? "pl_next" : c == "prev" ? "pl_previous" : null;
+            if (cmd == null) return false;
+            if (cmd == "") return true;                                    // already playing
+            return Ask(cmd) != null;
+        }
+
+        public static bool Seek(double sec)
+        {
+            if (!Configure() || sec < 0) return false;
+            return Ask("seek&val=" + ((long)Math.Round(sec)).ToString(CultureInfo.InvariantCulture)) != null;
+        }
+
+        // what = repeat | shuffle, set = on | off | "" (flip). VLC only has toggles, so the state is read first.
+        // "Repeat" here is VLC's "loop" (repeat the whole list); switching it off also clears "repeat one".
+        public static Dictionary<string, object> Flag(string what, string set)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            if ((what != "repeat" && what != "shuffle") || !Configure()) return d;
+            var j = Ask("");
+            if (j == null) return d;
+            bool random = Json.Flag(j, "random"), loop = Json.Flag(j, "loop"), one = Json.Flag(j, "repeat");
+            bool cur = what == "shuffle" ? random : (loop || one);
+            bool want = set == "on" ? true : set == "off" ? false : !cur;
+            if (want != cur)
+            {
+                if (what == "shuffle") j = Ask("pl_random");
+                else if (want) j = Ask("pl_loop");
+                else
+                {
+                    if (loop) j = Ask("pl_loop");
+                    if (one && j != null) j = Ask("pl_repeat");
+                }
+                if (j == null) return d;
+                Thread.Sleep(40);
+                j = Ask("") ?? j;
+            }
+            d["ok"] = true;
+            d["on"] = what == "shuffle" ? Json.Flag(j, "random") : (Json.Flag(j, "loop") || Json.Flag(j, "repeat"));
+            return d;
+        }
+
+        // The play queue: first branch of VLC's playlist tree (the second one is the media library).
+        static bool LoadList()
+        {
+            var r = Web.Call("GET", baseUrl + "/requests/playlist.json", auth, null, 2500);
+            var root = r.Code == 200 ? Json.Parse(r.Text) as Dictionary<string, object> : null;
+            if (root == null) return false;
+            var ids = new List<string>();
+            var tracks = new List<object>();
+            string name = "";
+            var top = root.ContainsKey("children") ? root["children"] as List<object> : null;
+            Dictionary<string, object> queue = null;
+            if (top != null)
+                foreach (var o in top)
+                {
+                    var n = o as Dictionary<string, object>;
+                    if (n != null && Json.Text(n, "type") == "node") { queue = n; break; }
+                }
+            if (queue == null) queue = root;
+            name = Json.Text(queue, "name");
+            Walk(queue, ids, tracks, 0);
+            long h = Remote.HashSeed;
+            for (int i = 0; i < ids.Count; i++)
+            {
+                var t = (Dictionary<string, object>)tracks[i];
+                h = Remote.Hash(h, ids[i]); h = Remote.Hash(h, (string)t["title"]);
+                h = Remote.Hash(h, ((double)t["duration"]).ToString("0", CultureInfo.InvariantCulture));
+            }
+            lock (gate)
+            {
+                listIds = ids; listTracks = tracks; listName = name;
+                listStamp = "vlc-" + ids.Count.ToString(CultureInfo.InvariantCulture) + "-" + h.ToString("x", CultureInfo.InvariantCulture);
+                listHave = true; listAt = Environment.TickCount;
+            }
+            return true;
+        }
+
+        static void Walk(Dictionary<string, object> node, List<string> ids, List<object> tracks, int depth)
+        {
+            var kids = node.ContainsKey("children") ? node["children"] as List<object> : null;
+            if (kids == null || depth > 12) return;
+            foreach (var o in kids)
+            {
+                var n = o as Dictionary<string, object>;
+                if (n == null) continue;
+                if (Json.Text(n, "type") == "node") { Walk(n, ids, tracks, depth + 1); continue; }
+                if (ids.Count >= MaxTracks) return;
+                string id = Json.Text(n, "id"), title = Json.Text(n, "name"), uri = Json.Text(n, "uri");
+                if (id == "") continue;
+                // an item VLC has not read the tags of yet is listed under its file name: drop the extension
+                try
+                {
+                    string last = Uri.UnescapeDataString(uri.Substring(uri.LastIndexOf('/') + 1));
+                    if (last != "" && last == title) title = NoExt(title);
+                }
+                catch { }
+                var t = new Dictionary<string, object>();
+                t["title"] = title; t["artist"] = ""; t["duration"] = Math.Round(Math.Max(0, Json.Number(n, "duration", 0)), 1);
+                ids.Add(id); tracks.Add(t);
+            }
+        }
+
+        public static Dictionary<string, object> Playlist(string since)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                if (!Configure() || !Live()) { d["error"] = "VLC is not connected"; return d; }
+                bool load;
+                lock (gate)
+                {
+                    listWant = true; listWantAt = Environment.TickCount;
+                    load = !listHave || unchecked(Environment.TickCount - listAt) > 6000;
+                }
+                if (load && !LoadList()) { d["error"] = "VLC did not send its playlist"; return d; }
+                lock (gate)
+                {
+                    if (listIds.Count == 0) { d["error"] = "the VLC playlist is empty"; return d; }
+                    d["ok"] = true; d["app"] = Id; d["name"] = listName; d["stamp"] = listStamp;
+                    d["count"] = listIds.Count; d["index"] = curId == "" ? -1 : listIds.IndexOf(curId);
+                    if (since != "" && since == listStamp) d["unchanged"] = true; else d["tracks"] = listTracks;
+                }
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        public static Dictionary<string, object> Jump(int index)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                if (!Configure()) { d["error"] = "not available"; return d; }
+                bool have;
+                lock (gate) have = listHave;
+                if (!have && !LoadList()) { d["error"] = "VLC did not send its playlist"; return d; }
+                string id;
+                lock (gate)
+                {
+                    if (index < 0 || index >= listIds.Count) { d["error"] = "no such track"; return d; }
+                    id = listIds[index];
+                }
+                if (Ask("pl_play&id=" + Uri.EscapeDataString(id)) == null) { d["error"] = "VLC did not answer"; return d; }
+                lock (gate) curId = id;
+                d["ok"] = true; d["index"] = index;
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+    }
+
+    // ------------------------------------------------------------------ foobar2000 through the Beefweb component
+    // foobar2000 already shows up as a source through Windows. With Beefweb installed (foo_beefweb, port 8880) the
+    // bridge adds its playlist, "play track n", shuffle / repeat and the audio details to that same source.
+    // Nothing is asked unless foobar2000 is listed as a source right now.
+    static class Foobar
+    {
+        const int MaxTracks = 3000;
+        const string PlayerColumns = "%5B%25codec%25%5D,%5B%25bitrate%25%5D,%5B%25samplerate%25%5D,%5B%25channels%25%5D";
+        const string ListColumns = "%25title%25,%5B%25artist%25%5D,%5B%25length_seconds%25%5D";
+        static readonly object gate = new object();
+
+        static string baseUrl = "", auth = "";
+        static bool cfgOk, cfgLooked;
+        static int cfgAt;
+
+        static bool seen;
+        static int seenAt;
+
+        // player state
+        static bool have;
+        static int haveAt;
+        static string plId = "";
+        static int item = -1, mode = -1;
+        static List<string> modes = new List<string>();
+        static string codec = "";
+        static int kbps, hz, ch;
+        static int failures, failedAt;
+        static string note = "foobar2000 is not a source right now";
+
+        // playlist
+        static List<object> listTracks = new List<object>();
+        static string listId = "", listName = "", listStamp = "", listSig = "";
+        static bool listHave;
+        static int listAt, listFullAt, listWantAt;
+        static bool listWant;
+
+        public static bool Is(string app)
+        {
+            return !string.IsNullOrEmpty(app) && app != Aimp.Id && app != Vlc.Id && Names.Friendly(app) == "foobar2000";
+        }
+
+        static bool Configure()
+        {
+            if (cfgLooked && unchecked(Environment.TickCount - cfgAt) < 3000) return cfgOk;
+            cfgLooked = true; cfgAt = Environment.TickCount;
+            cfgOk = false;
+            if (Ini.Off("foobar2000")) { note = "switched off in NocturneBridge.ini"; return false; }
+            string port = Ini.Get("foobar2000", "port"), user = Ini.Get("foobar2000", "user"), pass = Ini.Get("foobar2000", "password");
+            if (port == "" || (user == "" && pass == ""))
+            {
+                // Beefweb's own optional config file overrides what is set in foobar2000's preferences
+                try
+                {
+                    string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                    foreach (var dir in new[] { "foobar2000-v2", "foobar2000" })
+                    {
+                        string f = Path.Combine(appData, dir, "beefweb", "config.json");
+                        if (!File.Exists(f)) continue;
+                        var c = Json.Parse(File.ReadAllText(f)) as Dictionary<string, object>;
+                        if (c == null) continue;
+                        if (port == "" && c.ContainsKey("port")) port = Json.Number(c, "port", 0).ToString("0", CultureInfo.InvariantCulture);
+                        if (user == "" && pass == "" && Json.Flag(c, "authRequired")) { user = Json.Text(c, "authUser"); pass = Json.Text(c, "authPassword"); }
+                        break;
+                    }
+                }
+                catch { }
+            }
+            int p;
+            if (!int.TryParse(port, NumberStyles.Integer, CultureInfo.InvariantCulture, out p) || p < 1 || p > 65535) p = 8880;
+            baseUrl = "http://127.0.0.1:" + p.ToString(CultureInfo.InvariantCulture) + "/api";
+            auth = user != "" || pass != "" ? Web.Basic(user, pass) : "";
+            cfgOk = true;
+            return true;
+        }
+
+        static bool Fresh { get { return have && unchecked(Environment.TickCount - haveAt) <= 3000; } }
+
+        public static Dictionary<string, object> Status()
+        {
+            var d = new Dictionary<string, object>();
+            bool ok = false;
+            try { ok = Configure(); } catch { }
+            d["address"] = ok ? baseUrl : "";
+            lock (gate) d["state"] = Fresh ? "connected" : note;
+            return d;
+        }
+
+        // Called for the foobar2000 entry of /sessions: remembers that it is there and adds what Beefweb knows.
+        public static void Decorate(Dictionary<string, object> s)
+        {
+            lock (gate)
+            {
+                seen = true; seenAt = Environment.TickCount;
+                if (!Fresh) return;
+                s["playlist"] = true;
+                if (mode >= 0 && mode < modes.Count)
+                {
+                    s["shuffle"] = IsShuffle(modes[mode]);
+                    s["repeat"] = IsRepeat(modes[mode]);
+                }
+                if ((string)s["status"] != "stopped" && (codec != "" || kbps > 0 || hz > 0))
+                {
+                    s["format"] = codec; s["bitrate"] = kbps; s["sampleRate"] = hz; s["channels"] = ch;
+                }
+            }
+        }
+
+        static bool IsShuffle(string name) { string n = name.ToLowerInvariant(); return n.StartsWith("shuffle", StringComparison.Ordinal) || n.StartsWith("random", StringComparison.Ordinal); }
+        static bool IsRepeat(string name) { return name.ToLowerInvariant().StartsWith("repeat", StringComparison.Ordinal); }
+
+        public static void Tick()
+        {
+            bool wanted;
+            lock (gate) wanted = seen && unchecked(Environment.TickCount - seenAt) < 10000;
+            if (!wanted) { lock (gate) { have = false; note = "foobar2000 is not a source right now"; } return; }
+            if (!Configure()) { lock (gate) have = false; return; }
+            int now = Environment.TickCount;
+            if (failures > 0 && unchecked(now - failedAt) < (failures > 3 ? 10000 : 1500)) return;
+            if (!Ask()) return;
+            bool want;
+            lock (gate) want = listWant && unchecked(Environment.TickCount - listWantAt) < 12000
+                               && (!listHave || unchecked(Environment.TickCount - listAt) >= 2000);
+            if (want) { try { LoadList(); } catch { } }
+        }
+
+        static bool Ask()
+        {
+            var r = Web.Call("GET", baseUrl + "/player?columns=" + PlayerColumns, auth, null, 1500);
+            var p = r.Code == 200 ? Json.At(Json.Parse(r.Text), "player") as Dictionary<string, object> : null;
+            if (p == null)
+            {
+                lock (gate)
+                {
+                    failures++; failedAt = Environment.TickCount;
+                    note = r.Code == 401 ? "Beefweb asks for a password: put user and password in NocturneBridge.ini"
+                         : r.Code == 0 ? "no answer on " + baseUrl + " (Beefweb component not installed?)" : "unexpected answer (" + r.Code + ")";
+                    if (failures >= 2) have = false;
+                }
+                return false;
+            }
+            var a = Json.At(p, "activeItem") as Dictionary<string, object>;
+            var cols = a != null && a.ContainsKey("columns") ? a["columns"] as List<object> : null;
+            var names = p.ContainsKey("playbackModes") ? p["playbackModes"] as List<object> : null;
+            var m = new List<string>();
+            if (names != null) foreach (var o in names) m.Add(o as string ?? "");
+            lock (gate)
+            {
+                failures = 0; note = "connected";
+                plId = Json.Text(a, "playlistId");
+                item = (int)Json.Number(a, "index", -1);
+                mode = (int)Json.Number(p, "playbackMode", -1);
+                modes = m;
+                codec = ""; kbps = 0; hz = 0; ch = 0;
+                if (cols != null && item >= 0)
+                {
+                    string c = Col(cols, 0).ToUpperInvariant();
+                    codec = c.Length > 0 && c.Length <= 8 ? c : "";
+                    kbps = Num(Col(cols, 1)); hz = Num(Col(cols, 2));
+                    string chan = Col(cols, 3).ToLowerInvariant();
+                    ch = chan == "mono" ? 1 : chan == "stereo" ? 2 : Num(chan);
+                }
+                have = true; haveAt = Environment.TickCount;
+            }
+            return true;
+        }
+
+        static string Col(List<object> cols, int i) { return i < cols.Count ? (cols[i] as string ?? "").Trim() : ""; }
+        static int Num(string v)
+        {
+            int n = 0, i = 0;
+            while (i < v.Length && v[i] >= '0' && v[i] <= '9' && i < 9) { n = n * 10 + (v[i] - '0'); i++; }
+            return i == 0 ? 0 : n;
+        }
+
+        // The playlist that is playing; while stopped, the one that is open in foobar2000.
+        static bool LoadList()
+        {
+            var r = Web.Call("GET", baseUrl + "/playlists", auth, null, 1500);
+            var all = r.Code == 200 ? Json.At(Json.Parse(r.Text), "playlists") as List<object> : null;
+            if (all == null) return false;
+            string want;
+            lock (gate) want = item >= 0 ? plId : "";
+            Dictionary<string, object> pick = null, open = null;
+            foreach (var o in all)
+            {
+                var p = o as Dictionary<string, object>;
+                if (p == null) continue;
+                if (want != "" && Json.Text(p, "id") == want) pick = p;
+                if (Json.Flag(p, "isCurrent")) open = p;
+            }
+            if (pick == null) pick = open;
+            if (pick == null) { foreach (var o in all) { pick = o as Dictionary<string, object>; if (pick != null) break; } }
+            if (pick == null) { lock (gate) { listTracks = new List<object>(); listId = ""; listName = ""; listStamp = "foobar-empty"; listSig = ""; listHave = true; listAt = Environment.TickCount; } return true; }
+
+            string id = Json.Text(pick, "id");
+            string sig = id + "|" + Json.Number(pick, "itemCount", 0).ToString("0", CultureInfo.InvariantCulture) + "|"
+                       + Json.Number(pick, "totalTime", 0).ToString("0.###", CultureInfo.InvariantCulture);
+            lock (gate)
+            {
+                // same list, same size, same total time: keep the tracks; they are read again every 20 s in case of a re-order
+                if (listHave && sig == listSig && unchecked(Environment.TickCount - listFullAt) < 20000)
+                {
+                    listName = Json.Text(pick, "title"); listAt = Environment.TickCount;
+                    return true;
+                }
+            }
+            r = Web.Call("GET", baseUrl + "/playlists/" + Uri.EscapeDataString(id) + "/items/0:" + MaxTracks.ToString(CultureInfo.InvariantCulture) + "?columns=" + ListColumns, auth, null, 3000);
+            var items = r.Code == 200 ? Json.At(Json.Parse(r.Text), "playlistItems", "items") as List<object> : null;
+            if (items == null) return false;
+            var tracks = new List<object>();
+            long h = Remote.HashSeed;
+            foreach (var o in items)
+            {
+                var row = o as Dictionary<string, object>;
+                var cols = row != null && row.ContainsKey("columns") ? row["columns"] as List<object> : null;
+                if (cols == null) cols = new List<object>();
+                var t = new Dictionary<string, object>();
+                string title = Col(cols, 0), artist = Col(cols, 1);
+                int sec = Num(Col(cols, 2));
+                t["title"] = title; t["artist"] = artist; t["duration"] = (double)sec;
+                tracks.Add(t);
+                h = Remote.Hash(h, title); h = Remote.Hash(h, artist); h = Remote.Hash(h, sec.ToString(CultureInfo.InvariantCulture));
+                if (tracks.Count >= MaxTracks) break;
+            }
+            lock (gate)
+            {
+                listTracks = tracks; listId = id; listName = Json.Text(pick, "title"); listSig = sig;
+                listStamp = "foobar-" + id + "-" + tracks.Count.ToString(CultureInfo.InvariantCulture) + "-" + h.ToString("x", CultureInfo.InvariantCulture);
+                listHave = true; listAt = Environment.TickCount; listFullAt = listAt;
+            }
+            return true;
+        }
+
+        public static Dictionary<string, object> Playlist(string since)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                if (!Configure()) { d["error"] = "not available"; return d; }
+                bool fresh, load, resting;
+                lock (gate)
+                {
+                    seen = true; seenAt = Environment.TickCount;
+                    listWant = true; listWantAt = Environment.TickCount;
+                    fresh = Fresh;
+                    load = !listHave || unchecked(Environment.TickCount - listAt) > 6000;
+                    resting = failures > 0 && unchecked(Environment.TickCount - failedAt) < 5000;   // just failed: do not make the caller wait again
+                }
+                if (!fresh && (resting || !Ask())) { lock (gate) d["error"] = note; return d; }
+                if (load && !LoadList()) { d["error"] = "foobar2000 did not send its playlist"; return d; }
+                lock (gate)
+                {
+                    if (listTracks.Count == 0) { d["error"] = "the foobar2000 playlist is empty"; return d; }
+                    d["ok"] = true; d["name"] = listName; d["stamp"] = listStamp;
+                    d["count"] = listTracks.Count;
+                    d["index"] = item >= 0 && plId == listId && item < listTracks.Count ? item : -1;
+                    if (since != "" && since == listStamp) d["unchanged"] = true; else d["tracks"] = listTracks;
+                }
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        public static Dictionary<string, object> Jump(int index)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                if (!Configure()) { d["error"] = "not available"; return d; }
+                bool haveList;
+                lock (gate) haveList = listHave;
+                if (!haveList && !LoadList()) { d["error"] = "foobar2000 did not send its playlist"; return d; }
+                string id;
+                lock (gate)
+                {
+                    if (listId == "" || index < 0 || index >= listTracks.Count) { d["error"] = "no such track"; return d; }
+                    id = listId;
+                }
+                var r = Web.Call("POST", baseUrl + "/player/play/" + Uri.EscapeDataString(id) + "/" + index.ToString(CultureInfo.InvariantCulture), auth, null, 2000);
+                if (!r.Ok) { d["error"] = r.Code == 0 ? "foobar2000 did not answer" : "foobar2000 answered " + r.Code; return d; }
+                lock (gate) { plId = id; item = index; }
+                d["ok"] = true; d["index"] = index;
+            }
+            catch (Exception e) { d["ok"] = false; d["error"] = e.Message; }
+            return d;
+        }
+
+        // what = repeat | shuffle, set = on | off | "" (flip). foobar2000 has one "playback order": Default, Repeat (playlist),
+        // Repeat (track), Random, Shuffle (tracks) ... so switching one on replaces the other, switching off goes back to Default.
+        public static Dictionary<string, object> Flag(string what, string set)
+        {
+            var d = new Dictionary<string, object>();
+            d["ok"] = false;
+            try
+            {
+                if ((what != "repeat" && what != "shuffle") || !Configure() || !Ask()) return d;
+                List<string> m; int cur;
+                lock (gate) { m = modes; cur = mode; }
+                if (m.Count == 0 || cur < 0 || cur >= m.Count) return d;
+                bool isOn = what == "shuffle" ? IsShuffle(m[cur]) : IsRepeat(m[cur]);
+                bool want = set == "on" ? true : set == "off" ? false : !isOn;
+                if (want != isOn)
+                {
+                    int target = 0;
+                    if (want)
+                    {
+                        target = -1;
+                        string first = what == "shuffle" ? "shuffle" : "repeat";
+                        for (int i = 0; i < m.Count && target < 0; i++) if (m[i].ToLowerInvariant().StartsWith(first, StringComparison.Ordinal)) target = i;
+                        if (target < 0 && what == "shuffle")
+                            for (int i = 0; i < m.Count && target < 0; i++) if (IsShuffle(m[i])) target = i;
+                        if (target < 0) return d;
+                    }
+                    var r = Web.Call("POST", baseUrl + "/player", auth, "{\"playbackMode\":" + target.ToString(CultureInfo.InvariantCulture) + "}", 2000);
+                    if (!r.Ok) return d;
+                    Thread.Sleep(40);
+                    if (!Ask()) return d;
+                    lock (gate) { m = modes; cur = mode; }
+                    if (cur < 0 || cur >= m.Count) return d;
+                }
+                d["ok"] = true;
+                d["on"] = what == "shuffle" ? IsShuffle(m[cur]) : IsRepeat(m[cur]);
+            }
+            catch { d["ok"] = false; }
+            return d;
+        }
+    }
+
+    // ------------------------------------------------------------------ tiny JSON writer and reader
     static class Json
     {
         public static string Obj(params object[] kv)
@@ -1659,6 +3206,143 @@ namespace NocturneDeck
                 else sb.Append(c);
             }
             sb.Append('"');
+        }
+
+        // ---- reader, for what VLC and Beefweb answer: objects -> Dictionary<string, object>, arrays -> List<object>,
+        //      numbers -> double, strings, bool, null. Returns null when the text is not JSON.
+        public static object Parse(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            try
+            {
+                int i = 0;
+                object v = Value(s, ref i, 0);
+                Space(s, ref i);
+                return i == s.Length ? v : null;
+            }
+            catch { return null; }
+        }
+
+        static void Space(string s, ref int i)
+        {
+            while (i < s.Length && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t' || s[i] == (char)0xFEFF)) i++;
+        }
+
+        static object Value(string s, ref int i, int depth)
+        {
+            if (depth > 64) throw new FormatException("too deep");
+            Space(s, ref i);
+            if (i >= s.Length) throw new FormatException("end");
+            char c = s[i];
+            if (c == '{')
+            {
+                var d = new Dictionary<string, object>();
+                i++; Space(s, ref i);
+                if (i < s.Length && s[i] == '}') { i++; return d; }
+                while (true)
+                {
+                    Space(s, ref i);
+                    string key = Quoted(s, ref i);
+                    Space(s, ref i);
+                    if (i >= s.Length || s[i] != ':') throw new FormatException("colon");
+                    i++;
+                    d[key] = Value(s, ref i, depth + 1);
+                    Space(s, ref i);
+                    if (i < s.Length && s[i] == ',') { i++; continue; }
+                    if (i < s.Length && s[i] == '}') { i++; return d; }
+                    throw new FormatException("object");
+                }
+            }
+            if (c == '[')
+            {
+                var l = new List<object>();
+                i++; Space(s, ref i);
+                if (i < s.Length && s[i] == ']') { i++; return l; }
+                while (true)
+                {
+                    l.Add(Value(s, ref i, depth + 1));
+                    Space(s, ref i);
+                    if (i < s.Length && s[i] == ',') { i++; continue; }
+                    if (i < s.Length && s[i] == ']') { i++; return l; }
+                    throw new FormatException("array");
+                }
+            }
+            if (c == '"') return Quoted(s, ref i);
+            if (string.CompareOrdinal(s, i, "true", 0, 4) == 0) { i += 4; return true; }
+            if (string.CompareOrdinal(s, i, "false", 0, 5) == 0) { i += 5; return false; }
+            if (string.CompareOrdinal(s, i, "null", 0, 4) == 0) { i += 4; return null; }
+            int start = i;
+            while (i < s.Length && (char.IsDigit(s[i]) || s[i] == '-' || s[i] == '+' || s[i] == '.' || s[i] == 'e' || s[i] == 'E')) i++;
+            if (i == start) throw new FormatException("value");
+            return double.Parse(s.Substring(start, i - start), NumberStyles.Float, CultureInfo.InvariantCulture);
+        }
+
+        static string Quoted(string s, ref int i)
+        {
+            if (i >= s.Length || s[i] != '"') throw new FormatException("string");
+            i++;
+            var sb = new StringBuilder();
+            while (true)
+            {
+                if (i >= s.Length) throw new FormatException("open string");
+                char c = s[i++];
+                if (c == '"') return sb.ToString();
+                if (c != '\\') { sb.Append(c); continue; }
+                if (i >= s.Length) throw new FormatException("open escape");
+                char e = s[i++];
+                if (e == 'n') sb.Append('\n');
+                else if (e == 't') sb.Append('\t');
+                else if (e == 'r') sb.Append('\r');
+                else if (e == 'b') sb.Append('\b');
+                else if (e == 'f') sb.Append('\f');
+                else if (e == 'u')
+                {
+                    if (i + 4 > s.Length) throw new FormatException("open \\u");
+                    sb.Append((char)int.Parse(s.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+                    i += 4;
+                }
+                else sb.Append(e);                     // \" \\ \/
+            }
+        }
+
+        // Steps into nested objects: At(o, "a", "b") = o.a.b, null when anything on the way is missing.
+        public static object At(object o, params string[] path)
+        {
+            foreach (var key in path)
+            {
+                var d = o as Dictionary<string, object>;
+                if (d == null || !d.TryGetValue(key, out o)) return null;
+            }
+            return o;
+        }
+
+        // o[key] as text ("" when missing); numbers and booleans are written out.
+        public static string Text(object o, string key)
+        {
+            object v = At(o, key);
+            if (v == null) return "";
+            if (v is string) return (string)v;
+            if (v is bool) return (bool)v ? "true" : "false";
+            if (v is double) return ((double)v).ToString("0.######", CultureInfo.InvariantCulture);
+            return "";
+        }
+
+        public static double Number(object o, string key, double fallback)
+        {
+            object v = At(o, key);
+            if (v is double) return (double)v;
+            double n;
+            if (v is string && double.TryParse((string)v, NumberStyles.Float, CultureInfo.InvariantCulture, out n)) return n;
+            return fallback;
+        }
+
+        public static bool Flag(object o, string key)
+        {
+            object v = At(o, key);
+            if (v is bool) return (bool)v;
+            if (v is double) return (double)v != 0;
+            if (v is string) return string.Equals((string)v, "true", StringComparison.OrdinalIgnoreCase) || (string)v == "1";
+            return false;
         }
     }
 }

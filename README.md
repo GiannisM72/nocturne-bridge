@@ -9,6 +9,8 @@ iCUE widgets only receive the song title and artist. Nocturne Bridge adds everyt
 - **Real 48-band spectrum and VU/PPM meters** — whole PC or only the selected player
 - **Play state, track position and tap-to-seek**
 - **Volume knob, Mute and 100%**
+- **Playlist, track select, shuffle and repeat** for AIMP, VLC and foobar2000
+- **Mixer** — volume per program and the output device
 
 ## Download
 
@@ -23,11 +25,48 @@ iCUE widgets only receive the song title and artist. Nocturne Bridge adds everyt
 
 Right-click the tray icon for **Start automatically**, **Show status page** and **Exit**.
 
+## VLC and foobar2000
+
+AIMP needs nothing. These two need one setting in the player, once.
+
+**VLC** (it does not report to Windows at all, so without this it is not a source):
+
+1. VLC → **Tools → Preferences**, bottom left **Show settings: All**.
+2. **Interface → Main interfaces**: tick **Web**.
+3. **Interface → Main interfaces → Lua**: under **Lua HTTP** type any **Password**.
+4. **Save**, close VLC and start it again.
+
+The bridge reads the port and that password from VLC's own settings file (`%APPDATA%\vlc\vlcrc`) and talks to VLC on `127.0.0.1` only. VLC then appears as a source with title, position, cover, playlist, track select, shuffle and repeat.
+
+**foobar2000** (it already is a source; this adds playlist, track select, shuffle / repeat and the audio details):
+
+1. Install the **Beefweb Remote Control** component (`foo_beefweb`, foobar2000 1.6 or newer) from the foobar2000 components page.
+2. Restart foobar2000. Leave its port at **8880**.
+
+foobar2000 has one "playback order", so Shuffle and Repeat replace each other there.
+
+Only if you changed a port, or set a Beefweb user and password, put a `NocturneBridge.ini` next to `NocturneBridge.exe`:
+
+```ini
+[vlc]
+port=8080
+password=your VLC web password
+; enabled=off
+
+[foobar2000]
+port=8880
+user=
+password=
+; enabled=off
+```
+
+`Show status page` (tray icon) tells you under `vlc` and `foobar2000` whether each one is connected, and why not.
+
 ## About the Windows message
 
 Windows SmartScreen shows this for new programs from small, independent makers without a paid code-signing certificate. It is a notice about an unknown publisher, not a virus finding.
 
-- Listens on `http://localhost:8977` only — nothing outside your PC can reach it, and it never connects to the internet.
+- Listens on `http://localhost:8977` only — nothing outside your PC can reach it, and it never connects to the internet. The only connections it opens itself go to VLC and foobar2000 on this same PC (`127.0.0.1`), and only after you switched those on in the player.
 - No account, no ads, no tracking, no installer, no admin rights.
 - Audio is analysed live for the spectrum and never recorded or stored.
 - The full source is in this repository: [`NocturneBridge.cs`](NocturneBridge.cs).
@@ -56,7 +95,12 @@ Right-click the tray icon → untick **Start automatically** → **Exit**. Delet
 | `/control?app=&cmd=` | `play`, `pause`, `toggle`, `stop`, `next`, `prev` |
 | `/seek?app=&pos=` | jump to a position (seconds) |
 | `/volume?app=&set=&mute=` | volume 0–100, mute on/off/toggle |
-| `/toggle?app=aimp-remote&what=` | AIMP repeat / shuffle |
+| `/toggle?app=&what=&set=` | repeat / shuffle (AIMP, VLC, foobar2000): flip, or `set=on` / `set=off` |
+| `/playlist?app=&since=` | the playlist that player plays from, with the index of the playing track (read-only): AIMP 4/5, VLC, foobar2000. Sources that can do it carry `"playlist": true` in `/sessions` |
+| `/jump?app=&index=` | play that track of the playlist |
+| `/mixer` | every program that plays sound: volume, mute, live level; and the output devices |
+| `/mixer/set?app=&volume=&mute=` | volume 0–100 and mute on/off/toggle for one program |
+| `/output?set=` | make an output device the default |
 | `/art?app=` | album art image |
 | `/levels`, `/levels/stream` | meters and 48 spectrum bands (JSON / Server-Sent Events) |
 | `/debug` | status page |
