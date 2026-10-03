@@ -8,7 +8,8 @@
 // Windows plays now". Anything more needs a program on the PC.
 //
 // What it does NOT do: no internet access, no files written except one optional autostart
-// entry (HKCU ...\Run, only when you tick "Start automatically"), no admin rights.
+// entry (HKCU ...\Run, only when you answer Yes to the one-time question or tick
+// "Start automatically" in the tray menu), no admin rights.
 // It listens on http://localhost:8977 only, so nothing outside this PC can reach it.
 // The only connections it opens itself go to 127.0.0.1: VLC's web interface and foobar2000's
 // Beefweb component, and only when you have switched those on in the player.
@@ -36,15 +37,15 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("NOCTURNE DECK")]
 [assembly: AssemblyCompany("GM Edge Labs")]
 [assembly: AssemblyCopyright("GM Edge Labs 2026")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.1.0")]
+[assembly: AssemblyFileVersion("1.4.1.0")]
 
 namespace NocturneDeck
 {
     static class Program
     {
         public const int Port = 8977;
-        public const string Version = "1.4.0";
+        public const string Version = "1.4.1";
 
         [STAThread]
         static void Main()
@@ -110,18 +111,16 @@ namespace NocturneDeck
             return x.CompareTo(y);
         }
 
-        // Close every other copy of the bridge: same program name, same product, or whoever holds our port.
+        // Close every other copy of the bridge: same program name or same product.
         static void CloseOthers()
         {
             var me = System.Diagnostics.Process.GetCurrentProcess();
-            var portPids = PortOwners();
             foreach (var p in System.Diagnostics.Process.GetProcesses())
             {
                 try
                 {
                     if (p.Id == me.Id) continue;
-                    bool hit = portPids.Contains(p.Id)
-                        || string.Equals(p.ProcessName, me.ProcessName, StringComparison.OrdinalIgnoreCase)
+                    bool hit = string.Equals(p.ProcessName, me.ProcessName, StringComparison.OrdinalIgnoreCase)
                         || p.ProcessName.IndexOf("NocturneBridge", StringComparison.OrdinalIgnoreCase) >= 0;
                     if (!hit)
                     {
@@ -137,43 +136,6 @@ namespace NocturneDeck
                 }
                 catch { }
             }
-        }
-
-        // PIDs that registered http://localhost:<Port>/ with Windows (works in any Windows language)
-        static HashSet<int> PortOwners()
-        {
-            var found = new HashSet<int>();
-            try
-            {
-                var psi = new System.Diagnostics.ProcessStartInfo("netsh", "http show servicestate view=requestq")
-                { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
-                string text;
-                using (var pr = System.Diagnostics.Process.Start(psi))
-                {
-                    text = pr.StandardOutput.ReadToEnd();
-                    pr.WaitForExit(4000);
-                }
-                var pids = new List<int>();
-                bool ours = false;
-                string mark = ":" + Port + "/";
-                foreach (var raw in (text + "\nEND").Split('\n'))
-                {
-                    string line = raw.TrimEnd(new[] { '\r' });
-                    if (line.Length > 0 && !char.IsWhiteSpace(line[0]))
-                    {
-                        if (ours) foreach (int id in pids) found.Add(id);
-                        pids.Clear(); ours = false;
-                        continue;
-                    }
-                    string t = line.Trim();
-                    int n;
-                    if (t.Length > 0 && t.All(char.IsDigit) && int.TryParse(t, out n)) pids.Add(n);
-                    if (t.IndexOf(mark, StringComparison.OrdinalIgnoreCase) >= 0) ours = true;
-                }
-            }
-            catch { }
-            found.Remove(0); found.Remove(4);
-            return found;
         }
     }
 
@@ -218,10 +180,12 @@ namespace NocturneDeck
             }
             else if (FirstRun())
             {
-                // first start: turn autostart on so it just keeps working (can be switched off in the menu)
-                SetAutostart(true);
-                tray.ShowBalloonTip(6000, "NOCTURNE DECK Bridge is running",
-                    "It sits here in the tray and starts automatically. Right-click to change that or exit.", ToolTipIcon.Info);
+                // first start: ask once. Nothing is written unless the answer is Yes.
+                var r = MessageBox.Show("NOCTURNE DECK Bridge is now running. You find it in the tray next to the clock.\n\n" +
+                    "Start it automatically when Windows starts?\n\n" +
+                    "You can change this at any time: right-click the tray icon and use \"Start automatically\".",
+                    "NOCTURNE DECK Bridge", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r == DialogResult.Yes) SetAutostart(true);
             }
         }
 
@@ -251,7 +215,8 @@ namespace NocturneDeck
         {
             using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
             {
-                if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+                string want = "\"" + Application.ExecutablePath + "\"";
+                if (on) { if (!string.Equals(k.GetValue(RunName) as string, want, StringComparison.Ordinal)) k.SetValue(RunName, want); }
                 else k.DeleteValue(RunName, false);
             }
         }

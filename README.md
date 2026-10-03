@@ -21,9 +21,9 @@ iCUE widgets only receive the song title and artist. Nocturne Bridge adds everyt
 1. Unzip into a folder you keep, e.g. `Documents\Nocturne Deck\Nocturne Bridge`.
 2. Double-click `NocturneBridge.exe`.
 3. If Windows shows **"Windows protected your PC"**, click **More info**, then **Run anyway** (see below).
-4. A small bar-graph icon appears next to the clock. It starts automatically with Windows from now on.
+4. A small bar-graph icon appears next to the clock. The first time, it asks once whether it should start automatically with Windows. You can change your answer at any time.
 
-Right-click the tray icon for **Start automatically**, **Show status page** and **Exit**.
+Right-click the tray icon for **Start automatically** (off until you say Yes), **Show status page** and **Exit**.
 
 ## VLC and foobar2000
 
@@ -75,8 +75,12 @@ Windows SmartScreen shows this for new programs from small, independent makers w
 
 ## What it writes on your PC
 
-- `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `NOCTURNE DECK Bridge` (only while "Start automatically" is ticked)
+- `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `NOCTURNE DECK Bridge` (only while "Start automatically" is ticked; nothing is written unless you answer Yes to the one-time question or tick it)
 - `HKCU\Software\NocturneDeckBridge` (first-run flag)
+
+## Why some virus scanners flag it
+
+The program is small, new and has no paid code-signing certificate, so a few scanners that guess from behaviour ("machine learning" and "heuristic" verdicts, not named malware) may flag it. It closes an older copy of itself when you update, keeps a local web server on `localhost`, and can start with Windows, which are things such scanners watch for. Please check the source, build it yourself with `Build-it-yourself.cmd`, or compare the SHA256.
 
 ## Uninstall
 
